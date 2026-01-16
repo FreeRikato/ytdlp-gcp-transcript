@@ -1,25 +1,45 @@
 import yt_dlp
-import requests
-from fastapi import HTTPException
+import shutil
+import uuid
+import os
+import glob
+import logging
+from yt_dlp.networking.impersonate import ImpersonateTarget
 from .utils import clean_vtt_text
 
+logger = logging.getLogger(__name__)
+
+TEMP_DIR_BASE = os.environ.get('TEMP_DIR', '/tmp')
+YDLP_TIMEOUT = int(os.environ.get('YDLP_TIMEOUT', '300'))
+
 def fetch_youtube_data(video_url: str):
-    # Configuration to ensure we don't download the video/audio
+    request_id = str(uuid.uuid4())
+    temp_dir = f"{TEMP_DIR_BASE}/{request_id}"
+    os.makedirs(temp_dir, exist_ok=True)
+
     ydl_opts = {
-        'skip_download': True,        # We only want metadata
-        'writesubtitles': True,       # Signal we are interested in subs
-        'writeautomaticsub': True,    # Allow auto-generated subs if manual aren't there
-        'subtitleslangs': ['en'],     # English only
-        'quiet': True,                # Reduce log noise
+        'skip_download': True,
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['en'],
+        'subtitlesformat': 'vtt',
+        'quiet': True,
         'no_warnings': True,
+        'outtmpl': f'{temp_dir}/%(id)s.%(ext)s',
+        'impersonate': ImpersonateTarget.from_str('chrome'),
+        'js_runtimes': {'node': {}},
+        'socket_timeout': YDLP_TIMEOUT,
+        'extractor_args': {
+            'youtube': {
+                'skip': ['dash', 'hls']
+            }
+        }
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # 1. Extract info (network call to YouTube)
             info = ydl.extract_info(video_url, download=False)
             
-            # 2. Extract Metadata
             metadata = {
                 "id": info.get('id'),
                 "title": info.get('title'),
@@ -28,23 +48,16 @@ def fetch_youtube_data(video_url: str):
                 "duration": info.get('duration')
             }
 
-            # 3. Locate Subtitle URL
-            # yt-dlp structures subtitles in two places: 'subtitles' (manual) and 'automatic_captions'
-            # 'requested_subtitles' is a helper field yt-dlp creates for the chosen language
-            requested_subs = info.get('requested_subtitles')
+            ydl.download([video_url])
+
+            vtt_files = glob.glob(f"{temp_dir}/*.vtt")
             
-            if not requested_subs or 'en' not in requested_subs:
-                raise HTTPException(status_code=404, detail="No English subtitles found for this video.")
+            if not vtt_files:
+                raise ValueError("No English subtitles found.")
 
-            # The direct URL to the VTT file
-            vtt_url = requested_subs['en']['url']
+            with open(vtt_files[0], 'r', encoding='utf-8') as f:
+                raw_vtt = f.read()
 
-            # 4. Fetch the VTT content from the URL (In-Memory)
-            response = requests.get(vtt_url)
-            response.raise_for_status()
-            raw_vtt = response.text
-
-            # 5. Parse
             clean_subs = clean_vtt_text(raw_vtt)
 
             return {
@@ -54,9 +67,12 @@ def fetch_youtube_data(video_url: str):
             }
 
     except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL or video unavailable.")
-    except Exception as e:
-        # Re-raise HTTP exceptions, wrap others
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail=str(e))
+        error_str = str(e)
+        if "429" in error_str:
+            logger.error(f"CRITICAL: IP {request_id} Blocked by YouTube (429).")
+            raise ValueError("Server IP blocked by YouTube. Please try again later.")
+        raise ValueError("Invalid URL or video unavailable.")
+        
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
